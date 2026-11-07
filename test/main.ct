@@ -1,0 +1,575 @@
+#include <stdio.h>
+#include <string.h>
+
+import sql::Sql;
+
+/*
+ * sql 包的回归矩阵。没有第三方框架：check() 记录断言，main() 汇总并返回
+ * 非零退出码。每个用例只依赖 libc 和包本身，输出确定。
+ */
+
+struct Counters {
+    int run;
+    int fail;
+};
+
+void check(struct Counters *c, int ok, char *name)
+{
+    c->run = c->run + 1;
+    if (!ok) {
+        c->fail = c->fail + 1;
+        printf("not ok %d - %s\n", c->run, name);
+    } else {
+        printf("ok %d - %s\n", c->run, name);
+    }
+}
+
+int same(char *a, char *b)
+{
+    return a != 0 && b != 0 && strcmp(a, b) == 0;
+}
+
+int has(char *s, char *needle)
+{
+    return s != 0 && strstr(s, needle) != 0;
+}
+
+int count_char(char *s, char ch)
+{
+    int n = 0;
+
+    while (*s) {
+        if (*s == ch)
+            n = n + 1;
+        s = s + 1;
+    }
+    return n;
+}
+
+/* ---------------------------------------------------------------- SELECT */
+
+void t_select(struct Counters *c)
+{
+    struct sql_Select *q;
+    char buf[256];
+    char *s;
+    long iv = 0;
+    double dv = 0.0;
+    int n = 0;
+
+    q = "users".select("id, name");
+    n = q->toSql(buf, 256);
+    check(c, n > 0 && buf[n] == 0 && same(buf, "SELECT id, name FROM users"),
+          "select: basic sql");
+    check(c, q->status() == 0 && same(q->message(), "ok"),
+          "select: status 0 and message ok");
+    check(c, q->paramCount() == 0, "select: no params");
+    q->free();
+
+    q = "t".select("a")
+        .where("x = ?", 1)
+        .whereRaw("y IS NULL")
+        .where("z > ?", 2.5);
+    s = q->sql();
+    check(c, same(s, "SELECT a FROM t WHERE (x = ?) AND (y IS NULL) AND (z > ?)"),
+          "select: where append, raw condition, parentheses");
+    check(c, q->paramCount() == 2, "select: two params");
+    check(c, q->paramKind(0) == 1 && q->paramKind(1) == 2,
+          "select: kinds int,double");
+    check(c, q->paramInt(0, &iv) == 0 && iv == 1, "select: paramInt(0)");
+    check(c, q->paramDouble(1, &dv) == 0 && dv == 2.5, "select: paramDouble(1)");
+    check(c, q->paramText(0) == 0, "select: paramText rejects int");
+    check(c, q->paramInt(1, &iv) == -1, "select: paramInt rejects double");
+    check(c, q->paramDouble(0, &dv) == -1, "select: paramDouble rejects int");
+    check(c, q->paramKind(2) == -1, "select: paramKind out of range");
+    check(c, q->paramInt(-1, &iv) == -1, "select: paramInt negative index");
+    check(c, q->paramText(9) == 0, "select: paramText out of range");
+    q->free();
+
+    q = "users".select("id")
+        .groupBy("role")
+        .groupBy("dept")
+        .orderBy("id DESC")
+        .orderBy("name")
+        .limit(10)
+        .offset(20);
+    check(c, same(q->sql(),
+                  "SELECT id FROM users GROUP BY role, dept ORDER BY id DESC, name LIMIT 10 OFFSET 20"),
+          "select: group/order append, limit/offset");
+    q->free();
+
+    q = "users".select("id").limit(0).offset(0);
+    check(c, same(q->sql(), "SELECT id FROM users LIMIT 0 OFFSET 0"),
+          "select: zero limit and offset");
+    q->free();
+}
+
+void t_select_guard(struct Counters *c)
+{
+    struct sql_Select *q;
+    char buf[64];
+    char *s;
+
+    q = "users".select("id").offset(5);
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -2 &&
+              same(q->message(), "invalid builder state"),
+          "select: offset without limit rejected");
+    q->free();
+
+    q = "users".select("id").limit(-1);
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -3,
+          "select: negative limit rejected");
+    q->free();
+
+    q = "users".select("id").offset(-1);
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -3,
+          "select: negative offset rejected");
+    q->free();
+
+    q = "users".select("id").where("a = ? AND b = ?", 1);
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -5 &&
+              same(q->message(), "parameter count or type mismatch"),
+          "select: placeholder/value mismatch");
+    s = q->sql();
+    check(c, same(s, ""), "select: sql() empty after hard error");
+    q->free();
+
+    q = "users".select("id").whereRaw("");
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -3,
+          "select: empty raw condition rejected");
+    q->free();
+
+    q = "users".select("id").where("", 1);
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -3,
+          "select: empty condition with value rejected as argument");
+    q->free();
+
+    q = "users".select("id").groupBy("");
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -3,
+          "select: empty groupBy rejected");
+    q->free();
+
+    q = "users".select("id").orderBy("");
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -3,
+          "select: empty orderBy rejected");
+    q->free();
+
+    q = "".select("id");
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -3,
+          "select: empty table rejected");
+    q->free();
+
+    q = "users".select("");
+    check(c, q->toSql(buf, 64) == -1 && q->status() == -3,
+          "select: empty fields rejected");
+    q->free();
+}
+
+void t_select_buffers(struct Counters *c)
+{
+    struct sql_Select *q;
+    char buf[128];
+    char *s;
+    int n = 0;
+    int need = 0;
+
+    q = "users".select("id");
+    s = q->sql();
+    n = strlen(s);
+    need = n + 1;
+
+    check(c, q->toSql(buf, n) == -1 && q->status() == -4 &&
+              same(q->message(), "output buffer too small"),
+          "buffer: exactly n bytes is too small");
+    check(c, q->toSql(buf, need) == n && q->status() == 0 && same(buf, s),
+          "buffer: n+1 bytes succeeds and status clears");
+    q->free();
+}
+
+void t_select_borrow(struct Counters *c)
+{
+    struct sql_Select *q;
+    char *s;
+
+    q = "users".select("id");
+    s = q->sql();
+    check(c, same(s, "SELECT id FROM users"), "borrow: sql() before mutation");
+    q->where("x = ?", 1);
+    s = q->sql();
+    check(c, same(s, "SELECT id FROM users WHERE (x = ?)"),
+          "borrow: next sql() reflects mutation");
+    q->free();
+}
+
+void t_select_eight(struct Counters *c)
+{
+    struct sql_Select *q;
+    char *s;
+    long v = 0;
+
+    q = "t".select("a").where(
+        "a = ? AND b = ? AND c = ? AND d = ? AND e = ? AND f = ? AND g = ? AND h = ?",
+        1, 2, 3, 4, 5, 6, 7, 8);
+    s = q->sql();
+    check(c, q->paramCount() == 8 && count_char(s, '?') == 8,
+          "eight values: accepted");
+    check(c, q->paramInt(7, &v) == 0 && v == 8, "eight values: last param");
+    check(c, q->paramKind(7) == 1, "eight values: last kind");
+    q->free();
+}
+
+void t_injection(struct Counters *c)
+{
+    struct sql_Select *q;
+    char *evil = "x'; DROP TABLE users; --";
+    char *payload = "SELECT * FROM secrets";
+    char *s;
+
+    q = "users".select("id")
+        .where("name = ?", evil)
+        .where("note = ?", payload);
+    s = q->sql();
+    check(c, same(s, "SELECT id FROM users WHERE (name = ?) AND (note = ?)"),
+          "injection: statement text has only placeholders");
+    check(c, !has(s, "DROP") && !has(s, "secrets") && !has(s, "x'"),
+          "injection: values never reach the rendered SQL");
+    check(c, count_char(s, '?') == 2, "injection: placeholder count intact");
+    check(c, same(q->paramText(0), evil) && same(q->paramText(1), payload),
+          "injection: values preserved as bound params");
+    q->free();
+}
+
+/* ---------------------------------------------------------------- INSERT */
+
+void t_insert(struct Counters *c)
+{
+    struct sql_Insert *q;
+    char buf[256];
+    double dv = 0.0;
+    long iv = 0;
+    int n = 0;
+
+    q = "users".insert("name, age")
+        .values("alice", 30)
+        .values("bob", 25);
+    n = q->toSql(buf, 256);
+    check(c, n > 0 && same(buf, "INSERT INTO users (name, age) VALUES (?, ?), (?, ?)"),
+          "insert: multi-row sql");
+    check(c, q->paramCount() == 4, "insert: four params");
+    check(c, q->paramKind(0) == 3 && q->paramKind(1) == 1 &&
+              q->paramKind(2) == 3 && q->paramKind(3) == 1,
+          "insert: kinds");
+    check(c, same(q->paramText(0), "alice"), "insert: first text param");
+    check(c, q->paramInt(1, &iv) == 0 && iv == 30, "insert: second int param");
+    check(c, same(q->paramText(2), "bob"), "insert: third text param");
+    check(c, q->paramInt(3, &iv) == 0 && iv == 25, "insert: fourth int param");
+    check(c, q->paramInt(0, &iv) == -1, "insert: paramInt rejects text");
+    check(c, q->paramText(1) == 0, "insert: paramText rejects int");
+    check(c, q->paramKind(4) == -1, "insert: paramKind out of range");
+    check(c, q->status() == 0 && same(q->message(), "ok"),
+          "insert: status 0 and message ok");
+    q->free();
+
+    q = "users".insert("name, score")
+        .values("alice", 1.5)
+        .values("bob", 2.5);
+    check(c, same(q->sql(), "INSERT INTO users (name, score) VALUES (?, ?), (?, ?)"),
+          "insert: mixed types sql");
+    check(c, q->paramKind(1) == 2 && q->paramKind(3) == 2,
+          "insert: double kinds");
+    check(c, q->paramDouble(1, &dv) == 0 && dv == 1.5,
+          "insert: paramDouble");
+    check(c, same(q->paramText(2), "bob"), "insert: later text param");
+    q->free();
+
+    q = "t".insert("a, f(b, c)").values(1, 2);
+    check(c, same(q->sql(), "INSERT INTO t (a, f(b, c)) VALUES (?, ?)"),
+          "insert: column commas inside parens do not split");
+    q->free();
+
+    q = "t".insert("a").values(1).values(2).values(3);
+    check(c, same(q->sql(), "INSERT INTO t (a) VALUES (?), (?), (?)"),
+          "insert: three rows");
+    q->free();
+}
+
+void t_insert_guard(struct Counters *c)
+{
+    struct sql_Insert *q;
+    char buf[128];
+    char *s;
+
+    q = "users".insert("name, age").values("alice");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3 &&
+              same(q->message(), "invalid argument"),
+          "insert: value count != column count");
+    q->free();
+
+    q = "users".insert("name, age");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "insert: no values rejected");
+    q->free();
+
+    q = "users".insert("");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "insert: empty column list rejected");
+    q->free();
+
+    q = "users".insert("name,");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "insert: trailing empty column name rejected");
+    q->free();
+
+    q = "users".insert(",name");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "insert: leading empty column name rejected");
+    q->free();
+
+    q = "users".insert("name, , age");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "insert: whitespace-only column name rejected");
+    q->free();
+
+    q = "".insert("a");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "insert: empty table rejected");
+    q->free();
+
+    q = "users".insert("name, age").values("a", 1).values("b");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "insert: later row with wrong arity rejected");
+    s = q->sql();
+    check(c, same(s, ""), "insert: sql() empty after row error");
+    q->free();
+
+    q = "users".insert("name").values("a", 1);
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "insert: extra value rejected");
+    q->free();
+}
+
+/* ---------------------------------------------------------------- UPDATE */
+
+void t_update(struct Counters *c)
+{
+    struct sql_Update *q;
+    char buf[256];
+    long iv = 0;
+    double dv = 0.0;
+    int n = 0;
+
+    q = "users".update()
+        .where("id = ?", 7)
+        .set("name = ?", "carol")
+        .setRaw("updated_at = CURRENT_TIMESTAMP");
+    n = q->toSql(buf, 256);
+    check(c, n > 0 && same(buf,
+        "UPDATE users SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE (id = ?)"),
+        "update: set before where in sql");
+    check(c, q->paramCount() == 2, "update: two params");
+    check(c, q->paramKind(0) == 3 && q->paramKind(1) == 1,
+          "update: SET param comes before WHERE param");
+    check(c, same(q->paramText(0), "carol"), "update: first param is SET value");
+    check(c, q->paramInt(1, &iv) == 0 && iv == 7, "update: second param is WHERE value");
+    check(c, q->paramInt(0, &iv) == -1, "update: paramInt rejects SET text");
+    check(c, q->paramText(1) == 0, "update: paramText rejects WHERE int");
+    check(c, q->paramKind(2) == -1, "update: paramKind out of range");
+    check(c, q->status() == 0 && same(q->message(), "ok"),
+          "update: status 0 and message ok");
+    q->free();
+
+    q = "users".update().set("score = ?", 1.5).where("id = ?", 2);
+    check(c, q->paramKind(0) == 2 && q->paramKind(1) == 1,
+          "update: double SET param kind");
+    check(c, q->paramDouble(0, &dv) == 0 && dv == 1.5,
+          "update: paramDouble on SET");
+    q->free();
+
+    q = "users".update().setRaw("active = 0").whereRaw("id = 7");
+    check(c, same(q->sql(), "UPDATE users SET active = 0 WHERE (id = 7)"),
+          "update: raw set and raw where");
+    check(c, q->paramCount() == 0, "update: raw form has no params");
+    q->free();
+
+    q = "users".update().set("active = ?", 1).allowAll();
+    check(c, same(q->sql(), "UPDATE users SET active = ?"),
+          "update: allowAll drops the WHERE guard");
+    q->free();
+}
+
+void t_update_guard(struct Counters *c)
+{
+    struct sql_Update *q;
+    char buf[128];
+
+    q = "users".update().set("name = ?", "x");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -2 &&
+              same(q->message(), "invalid builder state"),
+          "update: no where rejected");
+    q->free();
+
+    q = "users".update().where("id = ?", 1);
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "update: no SET rejected");
+    q->free();
+
+    q = "users".update().set("a = ? AND b = ?", 1).where("id = ?", 1);
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -5,
+          "update: SET placeholder mismatch");
+    q->free();
+
+    q = "users".update().where("a = ? AND b = ?", 1).set("x = ?", 1);
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -5,
+          "update: WHERE placeholder mismatch");
+    q->free();
+
+    q = "users".update().setRaw("");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "update: empty setRaw rejected");
+    q->free();
+
+    q = "users".update().set("", 1).where("id = ?", 1);
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "update: empty SET expression rejected");
+    q->free();
+
+    q = "".update().set("a = ?", 1).where("id = ?", 1);
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "update: empty table rejected");
+    q->free();
+}
+
+/* ---------------------------------------------------------------- DELETE */
+
+void t_delete(struct Counters *c)
+{
+    struct sql_Delete *q;
+    char buf[256];
+    long iv = 0;
+    double dv = 0.0;
+    int n = 0;
+
+    q = "users".delete().where("id = ?", 7);
+    n = q->toSql(buf, 256);
+    check(c, n > 0 && same(buf, "DELETE FROM users WHERE (id = ?)"),
+          "delete: basic sql");
+    check(c, q->paramCount() == 1 && q->paramKind(0) == 1,
+          "delete: one int param");
+    check(c, q->paramInt(0, &iv) == 0 && iv == 7, "delete: paramInt");
+    check(c, q->paramText(0) == 0, "delete: paramText rejects int");
+    check(c, q->paramKind(1) == -1, "delete: paramKind out of range");
+    check(c, q->status() == 0 && same(q->message(), "ok"),
+          "delete: status 0 and message ok");
+    q->free();
+
+    q = "users".delete()
+        .where("name = ?", "bob")
+        .where("id = ?", 7);
+    check(c, same(q->sql(), "DELETE FROM users WHERE (name = ?) AND (id = ?)"),
+          "delete: where append");
+    check(c, q->paramKind(0) == 3 && q->paramKind(1) == 1,
+          "delete: text then int kinds");
+    check(c, same(q->paramText(0), "bob"), "delete: text param");
+    check(c, q->paramInt(1, &iv) == 0 && iv == 7, "delete: int param");
+    q->free();
+
+    q = "users".delete().where("score = ?", 2.5);
+    check(c, q->paramKind(0) == 2 && q->paramDouble(0, &dv) == 0 && dv == 2.5,
+          "delete: paramDouble");
+    q->free();
+
+    q = "users".delete().whereRaw("deleted_at IS NULL");
+    check(c, same(q->sql(), "DELETE FROM users WHERE (deleted_at IS NULL)"),
+          "delete: raw where");
+    q->free();
+
+    q = "users".delete().allowAll();
+    check(c, same(q->sql(), "DELETE FROM users"),
+          "delete: allowAll drops the WHERE guard");
+    q->free();
+}
+
+void t_delete_guard(struct Counters *c)
+{
+    struct sql_Delete *q;
+    char buf[128];
+
+    q = "users".delete();
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -2 &&
+              same(q->message(), "invalid builder state"),
+          "delete: no where rejected");
+    q->free();
+
+    q = "users".delete().where("a = ? AND b = ?", 1);
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -5,
+          "delete: placeholder mismatch");
+    q->free();
+
+    q = "users".delete().whereRaw("");
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "delete: empty raw where rejected");
+    q->free();
+
+    q = "".delete().where("id = ?", 1);
+    check(c, q->toSql(buf, 128) == -1 && q->status() == -3,
+          "delete: empty table rejected");
+    q->free();
+}
+
+/* ------------------------------------------------------------ NULL 与释放 */
+
+void t_null(struct Counters *c)
+{
+    struct sql_Select *q;
+    struct sql_Insert *ins;
+    struct sql_Update *up;
+    struct sql_Delete *del;
+    char buf[16];
+    char *s;
+
+    q = 0;
+    check(c, q->toSql(buf, 16) == -1, "null: select toSql fails");
+    s = q->sql();
+    check(c, s[0] == 0, "null: select sql() is empty");
+    check(c, q->paramCount() == 0, "null: select paramCount is zero");
+    check(c, q->paramKind(0) == -1, "null: select paramKind is -1");
+    check(c, q->paramText(0) == 0, "null: select paramText is NULL");
+    check(c, q->status() == -3, "null: select status is ARG");
+    check(c, same(q->message(), "invalid argument"), "null: select message");
+    q->free();
+
+    ins = 0;
+    ins->free();
+    up = 0;
+    up->free();
+    del = 0;
+    del->free();
+    q = 0;
+    q->free();
+    check(c, 1, "free: NULL is a no-op for all four handles");
+}
+
+int main(void)
+{
+    struct Counters c;
+
+    c.run = 0;
+    c.fail = 0;
+
+    t_select(&c);
+    t_select_guard(&c);
+    t_select_buffers(&c);
+    t_select_borrow(&c);
+    t_select_eight(&c);
+    t_injection(&c);
+    t_insert(&c);
+    t_insert_guard(&c);
+    t_update(&c);
+    t_update_guard(&c);
+    t_delete(&c);
+    t_delete_guard(&c);
+    t_null(&c);
+
+    printf("RESULT: %d assertions, %d failed\n", c.run, c.fail);
+    return c.fail == 0 ? 0 : 1;
+}

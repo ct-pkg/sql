@@ -1,0 +1,161 @@
+#include <stdio.h>
+#include <string.h>
+
+import sql::Sql;
+
+int main(void)
+{
+    struct sql_Select *q;
+    struct sql_Insert *ins;
+    struct sql_Update *up;
+    struct sql_Delete *del;
+    char buf[512];
+    char small[16];
+    char *s;
+    long id = 0;
+    long age = 0;
+    long age2 = 0;
+    double score = 0.0;
+    int n;
+
+    /* SELECT：表名是接收者，链式追加条件与子句。 */
+    q = "users".select("id, name")
+        .where("status = ? AND age > ?", 1, 18)
+        .whereRaw("deleted_at IS NULL")
+        .where("score > ?", 2.5)
+        .where("name = ?", "bob")
+        .groupBy("role")
+        .orderBy("id DESC")
+        .limit(10)
+        .offset(20);
+
+    n = q->toSql(buf, 512);
+    printf("toSql=%d status=%d\n", n, q->status());
+    printf("sql=%s\n", buf);
+    printf("params=%d kinds=%d,%d,%d,%d\n", q->paramCount(),
+           q->paramKind(0), q->paramKind(1), q->paramKind(2), q->paramKind(3));
+
+    if (q->paramInt(0, &id) == 0)
+        printf("p0=%ld\n", id);
+    if (q->paramInt(1, &id) == 0)
+        printf("p1=%ld\n", id);
+    if (q->paramDouble(2, &score) == 0)
+        printf("p2=%.1f\n", score);
+    printf("p3=%s\n", q->paramText(3));
+
+    /* 输出 buffer 太小：先拿状态和长度，再用足够大的 buffer 重试。 */
+    n = q->toSql(small, 16);
+    printf("small=%d status=%d msg=%s\n", n, q->status(), q->message());
+    s = q->sql();
+    printf("need=%d\n", (int)strlen(s) + 1);
+    n = q->toSql(buf, 512);
+    printf("retry=%d status=%d\n", n, q->status());
+    q->free();
+
+    /* offset 没有 limit：渲染期拒绝。 */
+    q = "users".select("id").offset(5);
+    n = q->toSql(buf, 512);
+    printf("offset_no_limit=%d status=%d msg=%s\n", n, q->status(), q->message());
+    q->free();
+
+    /* 占位符数量与绑定值数量不一致：立即记错误，渲染失败。 */
+    q = "users".select("id").where("a = ? AND b = ?", 1);
+    n = q->toSql(buf, 512);
+    printf("placeholder_mismatch=%d status=%d msg=%s\n", n, q->status(), q->message());
+    q->free();
+
+    /* 空表名 / 空字段：构造期拒绝。 */
+    q = "".select("id");
+    n = q->toSql(buf, 512);
+    printf("empty_table=%d status=%d msg=%s\n", n, q->status(), q->message());
+    q->free();
+
+    q = "users".select("");
+    n = q->toSql(buf, 512);
+    printf("empty_fields=%d status=%d msg=%s\n", n, q->status(), q->message());
+    q->free();
+
+    /* INSERT：values 一次一个行，可多行；值数必须等于列数。 */
+    ins = "users".insert("name, age")
+        .values("alice", 30)
+        .values("bob", 25);
+    n = ins->toSql(buf, 512);
+    printf("insert_toSql=%d status=%d\n", n, ins->status());
+    printf("insert_sql=%s\n", buf);
+    printf("insert_params=%d kinds=%d,%d,%d,%d\n", ins->paramCount(),
+           ins->paramKind(0), ins->paramKind(1), ins->paramKind(2), ins->paramKind(3));
+    if (ins->paramInt(1, &age) == 0 && ins->paramInt(3, &age2) == 0)
+        printf("insert_p0=%s insert_p1=%ld insert_p2=%s insert_p3=%ld\n",
+               ins->paramText(0), age, ins->paramText(2), age2);
+    ins->free();
+
+    ins = "users".insert("name, age").values("alice");
+    n = ins->toSql(buf, 512);
+    printf("insert_mismatch=%d status=%d msg=%s\n", n, ins->status(), ins->message());
+    ins->free();
+
+    ins = "users".insert("name, age");
+    n = ins->toSql(buf, 512);
+    printf("insert_no_values=%d status=%d msg=%s\n", n, ins->status(), ins->message());
+    ins->free();
+
+    /* UPDATE：参数顺序固定 SET 先、WHERE 后，与调用先后无关。 */
+    up = "users".update()
+        .where("id = ?", 7)
+        .set("name = ?", "carol")
+        .setRaw("updated_at = CURRENT_TIMESTAMP");
+    n = up->toSql(buf, 512);
+    printf("update_toSql=%d status=%d\n", n, up->status());
+    printf("update_sql=%s\n", buf);
+    printf("update_params=%d kinds=%d,%d\n", up->paramCount(),
+           up->paramKind(0), up->paramKind(1));
+    if (up->paramInt(1, &id) == 0)
+        printf("update_p0=%s update_p1=%ld\n", up->paramText(0), id);
+    up->free();
+
+    up = "users".update().set("name = ?", "x");
+    n = up->toSql(buf, 512);
+    printf("update_no_where=%d status=%d msg=%s\n", n, up->status(), up->message());
+    up->free();
+
+    up = "users".update().set("active = ?", 1).allowAll();
+    n = up->toSql(buf, 512);
+    printf("update_allow_all=%d status=%d sql=%s\n", n, up->status(), buf);
+    up->free();
+
+    up = "users".update().where("id = ?", 1);
+    n = up->toSql(buf, 512);
+    printf("update_no_set=%d status=%d msg=%s\n", n, up->status(), up->message());
+    up->free();
+
+    up = "users".update().set("a = ? AND b = ?", 1).where("id = ?", 1);
+    n = up->toSql(buf, 512);
+    printf("update_bad_set=%d status=%d msg=%s\n", n, up->status(), up->message());
+    up->free();
+
+    /* DELETE：与 UPDATE 同一套 WHERE 护栏。 */
+    del = "users".delete().where("id = ?", 7);
+    n = del->toSql(buf, 512);
+    printf("delete_toSql=%d status=%d\n", n, del->status());
+    printf("delete_sql=%s\n", buf);
+    printf("delete_params=%d kinds=%d\n", del->paramCount(), del->paramKind(0));
+    if (del->paramInt(0, &id) == 0)
+        printf("delete_p0=%ld\n", id);
+    del->free();
+
+    del = "users".delete();
+    n = del->toSql(buf, 512);
+    printf("delete_no_where=%d status=%d msg=%s\n", n, del->status(), del->message());
+    del->free();
+
+    del = "users".delete().allowAll();
+    n = del->toSql(buf, 512);
+    printf("delete_allow_all=%d status=%d sql=%s\n", n, del->status(), buf);
+    del->free();
+
+    /* free(NULL) 是 no-op。 */
+    q = 0;
+    q->free();
+    printf("free_null=ok\n");
+    return 0;
+}

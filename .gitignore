@@ -1,0 +1,7 @@
+# ct build output, kept out of the package tree.
+.ctbuild/
+build/
+.DS_Store
+
+# Installed packages of a consumer project, never part of this package.
+vendor/

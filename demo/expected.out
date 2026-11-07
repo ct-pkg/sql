@@ -1,0 +1,35 @@
+toSql=163 status=0
+sql=SELECT id, name FROM users WHERE (status = ? AND age > ?) AND (deleted_at IS NULL) AND (score > ?) AND (name = ?) GROUP BY role ORDER BY id DESC LIMIT 10 OFFSET 20
+params=4 kinds=1,1,2,3
+p0=1
+p1=18
+p2=2.5
+p3=bob
+small=-1 status=-4 msg=output buffer too small
+need=164
+retry=163 status=0
+offset_no_limit=-1 status=-2 msg=invalid builder state
+placeholder_mismatch=-1 status=-5 msg=parameter count or type mismatch
+empty_table=-1 status=-3 msg=invalid argument
+empty_fields=-1 status=-3 msg=invalid argument
+insert_toSql=51 status=0
+insert_sql=INSERT INTO users (name, age) VALUES (?, ?), (?, ?)
+insert_params=4 kinds=3,1,3,1
+insert_p0=alice insert_p1=30 insert_p2=bob insert_p3=25
+insert_mismatch=-1 status=-3 msg=invalid argument
+insert_no_values=-1 status=-3 msg=invalid argument
+update_toSql=72 status=0
+update_sql=UPDATE users SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE (id = ?)
+update_params=2 kinds=3,1
+update_p0=carol update_p1=7
+update_no_where=-1 status=-2 msg=invalid builder state
+update_allow_all=27 status=0 sql=UPDATE users SET active = ?
+update_no_set=-1 status=-3 msg=invalid argument
+update_bad_set=-1 status=-5 msg=parameter count or type mismatch
+delete_toSql=32 status=0
+delete_sql=DELETE FROM users WHERE (id = ?)
+delete_params=1 kinds=1
+delete_p0=7
+delete_no_where=-1 status=-2 msg=invalid builder state
+delete_allow_all=17 status=0 sql=DELETE FROM users
+free_null=ok
