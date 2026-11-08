@@ -18,12 +18,12 @@ int main(void)
     double score = 0.0;
     int n;
 
-    /* SELECT：表名是接收者，链式追加条件与子句。 */
+    /* SELECT：表名是接收者；where 里的 ? 由紧邻的 bind* 按顺序填充。 */
     q = "users".select("id, name")
-        .where("status = ? AND age > ?", 1, 18)
+        .where("status = ? AND age > ?").bindInt(1).bindInt(18)
         .whereRaw("deleted_at IS NULL")
-        .where("score > ?", 2.5)
-        .where("name = ?", "bob")
+        .where("score > ?").bindDouble(2.5)
+        .where("name = ?").bindText("bob")
         .groupBy("role")
         .orderBy("id DESC")
         .limit(10)
@@ -58,10 +58,10 @@ int main(void)
     printf("offset_no_limit=%d status=%d msg=%s\n", n, q->status(), q->message());
     q->free();
 
-    /* 占位符数量与绑定值数量不一致：立即记错误，渲染失败。 */
-    q = "users".select("id").where("a = ? AND b = ?", 1);
+    /* 占位符数量与绑定个数不一致：渲染期报 SQL_E_PARAM。 */
+    q = "users".select("id").where("a = ? AND b = ?").bindInt(1);
     n = q->toSql(buf, 512);
-    printf("placeholder_mismatch=%d status=%d msg=%s\n", n, q->status(), q->message());
+    printf("bind_mismatch=%d status=%d msg=%s\n", n, q->status(), q->message());
     q->free();
 
     /* 空表名 / 空字段：构造期拒绝。 */
@@ -75,10 +75,10 @@ int main(void)
     printf("empty_fields=%d status=%d msg=%s\n", n, q->status(), q->message());
     q->free();
 
-    /* INSERT：values 一次一个行，可多行；值数必须等于列数。 */
+    /* INSERT：row() 开一行，随后按列顺序 bind*；可多行。 */
     ins = "users".insert("name, age")
-        .values("alice", 30)
-        .values("bob", 25);
+        .row().bindText("alice").bindInt(30)
+        .row().bindText("bob").bindInt(25);
     n = ins->toSql(buf, 512);
     printf("insert_toSql=%d status=%d\n", n, ins->status());
     printf("insert_sql=%s\n", buf);
@@ -89,20 +89,20 @@ int main(void)
                ins->paramText(0), age, ins->paramText(2), age2);
     ins->free();
 
-    ins = "users".insert("name, age").values("alice");
+    ins = "users".insert("name, age").row().bindText("alice");
     n = ins->toSql(buf, 512);
-    printf("insert_mismatch=%d status=%d msg=%s\n", n, ins->status(), ins->message());
+    printf("insert_short_row=%d status=%d msg=%s\n", n, ins->status(), ins->message());
     ins->free();
 
     ins = "users".insert("name, age");
     n = ins->toSql(buf, 512);
-    printf("insert_no_values=%d status=%d msg=%s\n", n, ins->status(), ins->message());
+    printf("insert_no_row=%d status=%d msg=%s\n", n, ins->status(), ins->message());
     ins->free();
 
     /* UPDATE：参数顺序固定 SET 先、WHERE 后，与调用先后无关。 */
     up = "users".update()
-        .where("id = ?", 7)
-        .set("name = ?", "carol")
+        .where("id = ?").bindInt(7)
+        .set("name = ?").bindText("carol")
         .setRaw("updated_at = CURRENT_TIMESTAMP");
     n = up->toSql(buf, 512);
     printf("update_toSql=%d status=%d\n", n, up->status());
@@ -113,28 +113,28 @@ int main(void)
         printf("update_p0=%s update_p1=%ld\n", up->paramText(0), id);
     up->free();
 
-    up = "users".update().set("name = ?", "x");
+    up = "users".update().set("name = ?").bindText("x");
     n = up->toSql(buf, 512);
     printf("update_no_where=%d status=%d msg=%s\n", n, up->status(), up->message());
     up->free();
 
-    up = "users".update().set("active = ?", 1).allowAll();
+    up = "users".update().set("active = ?").bindInt(1).allowAll();
     n = up->toSql(buf, 512);
     printf("update_allow_all=%d status=%d sql=%s\n", n, up->status(), buf);
     up->free();
 
-    up = "users".update().where("id = ?", 1);
+    up = "users".update().where("id = ?").bindInt(1);
     n = up->toSql(buf, 512);
     printf("update_no_set=%d status=%d msg=%s\n", n, up->status(), up->message());
     up->free();
 
-    up = "users".update().set("a = ? AND b = ?", 1).where("id = ?", 1);
+    up = "users".update().set("a = ? AND b = ?").bindInt(1).where("id = ?").bindInt(1);
     n = up->toSql(buf, 512);
     printf("update_bad_set=%d status=%d msg=%s\n", n, up->status(), up->message());
     up->free();
 
     /* DELETE：与 UPDATE 同一套 WHERE 护栏。 */
-    del = "users".delete().where("id = ?", 7);
+    del = "users".delete().where("id = ?").bindInt(7);
     n = del->toSql(buf, 512);
     printf("delete_toSql=%d status=%d\n", n, del->status());
     printf("delete_sql=%s\n", buf);

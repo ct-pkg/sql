@@ -20,6 +20,43 @@
 
 ---
 
+## 0.1 修订（2026-11-08）：去掉变参，改为链式 bind
+
+**触发原因**：`ct v0.20.3` 的 trait 方法不支持变参，`struct sql_Select *where(char *cond, ...);`
+在解析阶段报 `error: expected a type (tok 4 '...')`。原方案里 `_Generic` + `SQL_ARGS_1..8`
+整套分派因此全部失效。
+
+**最终接口**：结构片段与值绑定分离，绑定紧邻它所属的片段。
+
+```ct
+"users".select("id, name").where("age > ?").bindInt(18).limit(10)
+"users".insert("name, age").row().bindText("alice").bindInt(30)
+"users".update().set("name = ?").bindText("carol").where("id = ?").bindInt(7)
+"users".delete().where("id = ?").bindInt(7)
+```
+
+- `where(cond)` / `set(expr)` / `row()` 只收字符串，片段里 `?` 的个数记进
+  `pend_need`；随后紧邻的 `bindInt` / `bindDouble` / `bindText` / `bindNull` 依次填入
+  对应数组并累加 `pend_got`。
+- 片段遇到下一次结构调用或渲染即冻结，`pend_got != pend_need` 报 `SQL_E_PARAM`（`-5`）。
+  `status()` 用只读方式做同样核对，不会改动 builder。
+- `whereRaw` / `setRaw` 不参与绑定计数，语义与阶段一一致。
+- UPDATE 的参数顺序仍固定 SET 先、WHERE 后；绑定跟着片段走，与调用先后无关。
+- 去掉了 8 个值上限；`SQL_E_ARG`（-3）不再承担「值数不等于占位符数」，改由 `SQL_E_PARAM` 承担。
+- 新增 `bindNull`，`kind == 0`，三种类型化读取接口对它一律返回失败。
+- C 面全部变成定参函数：`Sql.shim.h` 不再有 `_Generic` / `SQL_NARG` / `SQL_ARGS_*`，
+  `ct.pkg` 不再需要 `cflags = -std=c11`，`requires` 提升到 `ct >= 0.20.3`。
+
+**已实测**：字面量接收者 + 多段长链、方法调用结果再次作接收者、零参方法（`row()`）出现在链中间、
+链先落变量再续接，均在 `ct v0.20.3`（`/Users/samxx/.local/bin/ct`）上编译运行通过；
+`-Wall -Wextra` 零警告。原先「链式只能起一段」的担心不成立，但文档仍建议多段链落变量，便于阅读。
+
+**本文其余章节保留 2026-11-07 的探针记录与推演过程，其中提到 `...`、`_Generic`、`SQL_ARGS*`、
+8 个值上限、`whereRaw` 只为零值而存在的结论均为历史内容，已被本节取代。**
+
+
+---
+
 ## 1. 目标与非目标
 
 ### 1.1 目标
@@ -216,7 +253,7 @@ $ ./build/rel_both_const_recv
 
 | 模块 | 已占用的 `char *` 方法名 |
 | --- | --- |
-| `std::str::String` | `len`、`find`、`findChar`、`startsWith`、`endsWith`、`copy`、`slice`、`concat`、`toLower`、`toUpper`、`compare`、`copyFrom`、`copyTo`、`toInt`、`toDouble` |
+| `std::str::String` | `len`、`find`、`findChar`、`startsWith`、`endsWith`、`copy`、`slice`、`concat`、`toLower`、`toUpper`、`compare`、`copyTo`、`toInt`、`toDouble` |
 | `std::io::Path` | `open` |
 | `std::fs::FsOps` | `exists`、`readFile`、`writeFile`、`list` |
 | `std::utf8::Utf8Ops` | `decode`、`codepointCount`、`encode` |

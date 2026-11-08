@@ -8,11 +8,15 @@
  * 宿主选择：
  *   - `char *`：表名是接收者，提供四个入口 select / insert / update / delete；
  *   - `struct sql_Select|Insert|Update|Delete *`：四种语句各自一个句柄类型，
- *     方法集合编译期隔离（SELECT 没有 values，INSERT 没有 where）。
+ *     方法集合编译期隔离（SELECT 没有 row，INSERT 没有 where）。
+ *
+ * 值绑定不走 trait 变参（0.20.3 不支持），而是"结构片段 + 紧邻 bind"：
+ * 片段里 `?` 的个数决定随后必须出现多少次 bind*；绑定数不齐就是
+ * SQL_E_PARAM。这样每个方法都是定参签名，C 面不需要调用点类型分派或实参计数。
  *
  * `char *` 是全仓公共宿主，本包只占用 select / insert / update / delete
  * 四个名字（见 docs/char-host-methods.md）；不写 `const char *` 孪生宿主，
- * 因为类型键会丢弃任意位置的 const/volatile，写第二份在 0.20.0 上直接歧义。
+ * 因为类型键会丢弃任意位置的 const/volatile，写第二份在 0.20.x 上直接歧义。
  */
 
 namespace sql;
@@ -34,8 +38,12 @@ map trait Entry for type char * {
 
 // SELECT：链式条件与子句。
 pub trait Select {
-    struct sql_Select *where(char *cond, ...);
+    struct sql_Select *where(char *cond);
     struct sql_Select *whereRaw(char *cond);
+    struct sql_Select *bindInt(long v);
+    struct sql_Select *bindDouble(double v);
+    struct sql_Select *bindText(char *s);
+    struct sql_Select *bindNull();
     struct sql_Select *groupBy(char *expr);
     struct sql_Select *orderBy(char *expr);
     struct sql_Select *limit(int n);
@@ -53,8 +61,12 @@ pub trait Select {
 }
 
 map trait Select for type struct sql_Select * {
-    where(q, cond, ...) -> sql_select_where(q, cond, ...);
+    where(q, cond) -> sql_select_where(q, cond);
     whereRaw(q, cond) -> sql_select_where_raw(q, cond);
+    bindInt(q, v) -> sql_select_bind_int(q, v);
+    bindDouble(q, v) -> sql_select_bind_double(q, v);
+    bindText(q, s) -> sql_select_bind_text(q, s);
+    bindNull(q) -> sql_select_bind_null(q);
     groupBy(q, expr) -> sql_select_group_by(q, expr);
     orderBy(q, expr) -> sql_select_order_by(q, expr);
     limit(q, n) -> sql_select_limit(q, n);
@@ -71,9 +83,13 @@ map trait Select for type struct sql_Select * {
     free(q) -> sql_select_free(q);
 }
 
-// INSERT：values 一次追加一行，值数必须等于列数。
+// INSERT：row() 开一行，随后按列顺序 bind*；值数必须等于列数。
 pub trait Insert {
-    struct sql_Insert *values(...);
+    struct sql_Insert *row();
+    struct sql_Insert *bindInt(long v);
+    struct sql_Insert *bindDouble(double v);
+    struct sql_Insert *bindText(char *s);
+    struct sql_Insert *bindNull();
     int toSql(char *out, int cap);
     char *sql();
     int paramCount();
@@ -87,7 +103,11 @@ pub trait Insert {
 }
 
 map trait Insert for type struct sql_Insert * {
-    values(q, ...) -> sql_insert_values(q, ...);
+    row(q) -> sql_insert_row(q);
+    bindInt(q, v) -> sql_insert_bind_int(q, v);
+    bindDouble(q, v) -> sql_insert_bind_double(q, v);
+    bindText(q, s) -> sql_insert_bind_text(q, s);
+    bindNull(q) -> sql_insert_bind_null(q);
     toSql(q, out, cap) -> sql_insert_to_sql(q, out, cap);
     sql(q) -> sql_insert_sql(q);
     paramCount(q) -> sql_insert_param_count(q);
@@ -102,10 +122,14 @@ map trait Insert for type struct sql_Insert * {
 
 // UPDATE：SET 与 WHERE 分开；没有 WHERE 时必须显式 allowAll()。
 pub trait Update {
-    struct sql_Update *set(char *expr, ...);
+    struct sql_Update *set(char *expr);
     struct sql_Update *setRaw(char *expr);
-    struct sql_Update *where(char *cond, ...);
+    struct sql_Update *where(char *cond);
     struct sql_Update *whereRaw(char *cond);
+    struct sql_Update *bindInt(long v);
+    struct sql_Update *bindDouble(double v);
+    struct sql_Update *bindText(char *s);
+    struct sql_Update *bindNull();
     struct sql_Update *allowAll();
     int toSql(char *out, int cap);
     char *sql();
@@ -120,10 +144,14 @@ pub trait Update {
 }
 
 map trait Update for type struct sql_Update * {
-    set(q, expr, ...) -> sql_update_set(q, expr, ...);
+    set(q, expr) -> sql_update_set(q, expr);
     setRaw(q, expr) -> sql_update_set_raw(q, expr);
-    where(q, cond, ...) -> sql_update_where(q, cond, ...);
+    where(q, cond) -> sql_update_where(q, cond);
     whereRaw(q, cond) -> sql_update_where_raw(q, cond);
+    bindInt(q, v) -> sql_update_bind_int(q, v);
+    bindDouble(q, v) -> sql_update_bind_double(q, v);
+    bindText(q, s) -> sql_update_bind_text(q, s);
+    bindNull(q) -> sql_update_bind_null(q);
     allowAll(q) -> sql_update_allow_all(q);
     toSql(q, out, cap) -> sql_update_to_sql(q, out, cap);
     sql(q) -> sql_update_sql(q);
@@ -139,8 +167,12 @@ map trait Update for type struct sql_Update * {
 
 // DELETE：没有 WHERE 时必须显式 allowAll()。
 pub trait Delete {
-    struct sql_Delete *where(char *cond, ...);
+    struct sql_Delete *where(char *cond);
     struct sql_Delete *whereRaw(char *cond);
+    struct sql_Delete *bindInt(long v);
+    struct sql_Delete *bindDouble(double v);
+    struct sql_Delete *bindText(char *s);
+    struct sql_Delete *bindNull();
     struct sql_Delete *allowAll();
     int toSql(char *out, int cap);
     char *sql();
@@ -155,8 +187,12 @@ pub trait Delete {
 }
 
 map trait Delete for type struct sql_Delete * {
-    where(q, cond, ...) -> sql_delete_where(q, cond, ...);
+    where(q, cond) -> sql_delete_where(q, cond);
     whereRaw(q, cond) -> sql_delete_where_raw(q, cond);
+    bindInt(q, v) -> sql_delete_bind_int(q, v);
+    bindDouble(q, v) -> sql_delete_bind_double(q, v);
+    bindText(q, s) -> sql_delete_bind_text(q, s);
+    bindNull(q) -> sql_delete_bind_null(q);
     allowAll(q) -> sql_delete_allow_all(q);
     toSql(q, out, cap) -> sql_delete_to_sql(q, out, cap);
     sql(q) -> sql_delete_sql(q);

@@ -12,6 +12,11 @@
  * 所有输入字符串都复制一份，builder 自包含：调用方可以在链式调用后立刻
  * 复用或释放自己的 buffer。文本参数由 builder 持有，free() 时统一释放。
  *
+ * 绑定模型：`where(cond)` / `set(expr)` / `row()` 打开一个"待绑定片段"，
+ * 记下片段里 `?` 的个数；随后紧邻的 `bindInt` / `bindDouble` / `bindText` /
+ * `bindNull` 依次填进去。片段被下一次结构调用（再一个 where/set/row、
+ * groupBy、limit、toSql……）冻结：绑定数不等于占位符数即 SQL_E_PARAM。
+ *
  * 参数顺序 = 渲染后的 SQL 文本顺序：SELECT/INSERT/DELETE 是调用顺序，
  * UPDATE 固定为 SET 先、WHERE 后（与调用先后无关）。
  */
@@ -22,6 +27,22 @@ enum {
     SQL_STMT_UPDATE,
     SQL_STMT_DELETE
 };
+
+/* 当前开放的待绑定片段所属的数组。 */
+enum {
+    PEND_NONE = 0,
+    PEND_WHERE,
+    PEND_SET,
+    PEND_VALUES
+};
+
+/* 绑定值的 kind：0 null、1 int、2 double、3 text。 */
+typedef struct sql_value {
+    int kind;
+    long long i;
+    double d;
+    char *s; /* 由 builder 拥有，free() 时释放 */
+} sql_value;
 
 struct sql_buf {
     char *p;
@@ -45,6 +66,9 @@ struct sql_Query {
     sql_value *values; /* INSERT 值，按行展平 */
     int nvalues;
     int capvalues;
+    int pend_target;
+    int pend_need;
+    int pend_got;
     char *group;
     char *order;
     int limit;
@@ -344,20 +368,52 @@ static int append_condition(struct sql_Query *q, const char *cond)
     return buf_add(b, ")");
 }
 
+/* ------------------------------------------------------------ 待绑定片段 */
+
+static int pend_ok(const struct sql_Query *q)
+{
+    return q->pend_need == q->pend_got;
+}
+
+static void pend_begin(struct sql_Query *q, int target, int need)
+{
+    q->pend_target = target;
+    q->pend_need = need;
+    q->pend_got = 0;
+}
+
+static void pend_clear(struct sql_Query *q)
+{
+    q->pend_target = PEND_NONE;
+    q->pend_need = 0;
+    q->pend_got = 0;
+}
+
+/* 冻结当前片段：绑定数必须已齐，否则记 SQL_E_PARAM。 */
+static int pend_freeze(struct sql_Query *q)
+{
+    if (!pend_ok(q)) {
+        q_fail(q, SQL_E_PARAM);
+        return -1;
+    }
+    pend_clear(q);
+    return 0;
+}
+
 /* ------------------------------------------------------------ 值构造函数 */
 
-sql_value sql_v_int(long long v)
+static sql_value val_int(long v)
 {
     sql_value x;
 
     x.kind = 1;
-    x.i = v;
+    x.i = (long long)v;
     x.d = 0.0;
     x.s = NULL;
     return x;
 }
 
-sql_value sql_v_dbl(double v)
+static sql_value val_double(double v)
 {
     sql_value x;
 
@@ -368,7 +424,7 @@ sql_value sql_v_dbl(double v)
     return x;
 }
 
-sql_value sql_v_str(const char *s)
+static sql_value val_text(const char *s)
 {
     sql_value x;
 
@@ -379,42 +435,90 @@ sql_value sql_v_str(const char *s)
     return x;
 }
 
-/* ---------------------------------------------------------------- 共享操作 */
-
-static struct sql_Query *where_impl(struct sql_Query *q, char *cond, int n,
-                                    const sql_value *vals)
+static sql_value val_null(void)
 {
-    int i;
+    sql_value x;
 
+    x.kind = 0;
+    x.i = 0;
+    x.d = 0.0;
+    x.s = NULL;
+    return x;
+}
+
+/*
+ * 把一个值压进当前开放片段。没有开放片段、或片段已经填满，都视为
+ * "绑定与占位符数量不一致"（SQL_E_PARAM）。失败时释放值的文本所有权。
+ */
+static int pend_push(struct sql_Query *q, sql_value v)
+{
     if (!q) {
-        free_values((sql_value *)vals, n);
-        return NULL;
+        free(v.s);
+        return -1;
     }
     if (is_hard(q->status)) {
-        free_values((sql_value *)vals, n);
-        return q;
+        free(v.s);
+        return -1;
     }
-    if (!cond || !cond[0] || n < 0 || n > 8) {
-        q_fail(q, SQL_E_ARG);
-        free_values((sql_value *)vals, n);
-        return q;
-    }
-    if (count_placeholders(cond) != n) {
+    if (q->pend_target == PEND_NONE || q->pend_got >= q->pend_need) {
+        free(v.s);
         q_fail(q, SQL_E_PARAM);
-        free_values((sql_value *)vals, n);
+        return -1;
+    }
+    switch (q->pend_target) {
+    case PEND_WHERE:
+        if (reserve_where(q, 1) != 0) {
+            free(v.s);
+            q_fail(q, SQL_E_OOM);
+            return -1;
+        }
+        q->where_params[q->nwhere++] = v;
+        break;
+    case PEND_SET:
+        if (reserve_set(q, 1) != 0) {
+            free(v.s);
+            q_fail(q, SQL_E_OOM);
+            return -1;
+        }
+        q->set_params[q->nset++] = v;
+        break;
+    case PEND_VALUES:
+        if (reserve_values(q, 1) != 0) {
+            free(v.s);
+            q_fail(q, SQL_E_OOM);
+            return -1;
+        }
+        q->values[q->nvalues++] = v;
+        break;
+    default:
+        free(v.s);
+        q_fail(q, SQL_E_PARAM);
+        return -1;
+    }
+    q->pend_got++;
+    invalidate(q);
+    return 0;
+}
+
+/* ---------------------------------------------------------------- 共享操作 */
+
+static struct sql_Query *where_begin(struct sql_Query *q, char *cond)
+{
+    if (!q)
+        return NULL;
+    if (is_hard(q->status))
+        return q;
+    if (pend_freeze(q) != 0)
+        return q;
+    if (!cond || !cond[0]) {
+        q_fail(q, SQL_E_ARG);
         return q;
     }
-    if (reserve_where(q, n) != 0) {
-        q_fail(q, SQL_E_OOM);
-        free_values((sql_value *)vals, n);
-        return q;
-    }
-    for (i = 0; i < n; i++)
-        q->where_params[q->nwhere++] = vals[i];
     if (append_condition(q, cond) != 0) {
         q_fail(q, SQL_E_OOM);
         return q;
     }
+    pend_begin(q, PEND_WHERE, count_placeholders(cond));
     invalidate(q);
     return q;
 }
@@ -424,6 +528,8 @@ static struct sql_Query *where_raw(struct sql_Query *q, char *cond)
     if (!q)
         return NULL;
     if (is_hard(q->status))
+        return q;
+    if (pend_freeze(q) != 0)
         return q;
     if (!cond || !cond[0]) {
         q_fail(q, SQL_E_ARG);
@@ -437,40 +543,23 @@ static struct sql_Query *where_raw(struct sql_Query *q, char *cond)
     return q;
 }
 
-static struct sql_Query *set_impl(struct sql_Query *q, char *expr, int n,
-                                  const sql_value *vals)
+static struct sql_Query *set_begin(struct sql_Query *q, char *expr)
 {
-    int i;
-
-    if (!q) {
-        free_values((sql_value *)vals, n);
+    if (!q)
         return NULL;
-    }
-    if (is_hard(q->status)) {
-        free_values((sql_value *)vals, n);
+    if (is_hard(q->status))
         return q;
-    }
-    if (!expr || !expr[0] || n < 0 || n > 8) {
+    if (pend_freeze(q) != 0)
+        return q;
+    if (!expr || !expr[0]) {
         q_fail(q, SQL_E_ARG);
-        free_values((sql_value *)vals, n);
         return q;
     }
-    if (count_placeholders(expr) != n) {
-        q_fail(q, SQL_E_PARAM);
-        free_values((sql_value *)vals, n);
-        return q;
-    }
-    if (reserve_set(q, n) != 0) {
-        q_fail(q, SQL_E_OOM);
-        free_values((sql_value *)vals, n);
-        return q;
-    }
-    for (i = 0; i < n; i++)
-        q->set_params[q->nset++] = vals[i];
     if (append_list(&q->set, expr) != 0) {
         q_fail(q, SQL_E_OOM);
         return q;
     }
+    pend_begin(q, PEND_SET, count_placeholders(expr));
     invalidate(q);
     return q;
 }
@@ -480,6 +569,8 @@ static struct sql_Query *set_raw(struct sql_Query *q, char *expr)
     if (!q)
         return NULL;
     if (is_hard(q->status))
+        return q;
+    if (pend_freeze(q) != 0)
         return q;
     if (!expr || !expr[0]) {
         q_fail(q, SQL_E_ARG);
@@ -498,6 +589,8 @@ static struct sql_Query *allow_all(struct sql_Query *q)
     if (!q)
         return NULL;
     if (is_hard(q->status))
+        return q;
+    if (pend_freeze(q) != 0)
         return q;
     q->allow_all = 1;
     invalidate(q);
@@ -518,6 +611,8 @@ static int render(struct sql_Query *q)
     b.len = 0;
     b.cap = 0;
     if (!q || is_hard(q->status))
+        return -1;
+    if (pend_freeze(q) != 0)
         return -1;
     free(q->rendered);
     q->rendered = NULL;
@@ -652,6 +747,8 @@ static int param_total(struct sql_Query *q)
 {
     if (!q)
         return 0;
+    if (pend_freeze(q) != 0)
+        return 0;
     switch (q->stmt) {
     case SQL_STMT_INSERT:
         return q->nvalues;
@@ -719,9 +816,24 @@ static char *param_text(struct sql_Query *q, int i)
     return v->s;
 }
 
+/*
+ * status() 是只读查询：把"片段还没绑满"也报成 SQL_E_PARAM，
+ * 但不改动 builder，免得一次 status() 让后续 bind 失效。
+ */
+static int q_status(struct sql_Query *q)
+{
+    if (!q)
+        return SQL_E_ARG;
+    if (is_hard(q->status))
+        return q->status;
+    if (!pend_ok(q))
+        return SQL_E_PARAM;
+    return q->status;
+}
+
 static char *q_message(struct sql_Query *q)
 {
-    switch (q ? q->status : SQL_E_ARG) {
+    switch (q_status(q)) {
     case SQL_E_OK:
         return (char *)"ok";
     case SQL_E_OOM:
@@ -777,15 +889,42 @@ struct sql_Select *sql_select_new(char *table, char *fields)
     return s;
 }
 
-struct sql_Select *sql_select_where_impl(struct sql_Select *q, char *cond,
-                                         int n, const sql_value *vals)
+struct sql_Select *sql_select_where(struct sql_Select *q, char *cond)
 {
-    return (struct sql_Select *)where_impl(q ? &q->q : NULL, cond, n, vals);
+    return (struct sql_Select *)where_begin(q ? &q->q : NULL, cond);
 }
 
 struct sql_Select *sql_select_where_raw(struct sql_Select *q, char *cond)
 {
     return (struct sql_Select *)where_raw(q ? &q->q : NULL, cond);
+}
+
+struct sql_Select *sql_select_bind_int(struct sql_Select *q, long v)
+{
+    if (q)
+        pend_push(&q->q, val_int(v));
+    return q;
+}
+
+struct sql_Select *sql_select_bind_double(struct sql_Select *q, double v)
+{
+    if (q)
+        pend_push(&q->q, val_double(v));
+    return q;
+}
+
+struct sql_Select *sql_select_bind_text(struct sql_Select *q, char *s)
+{
+    if (q)
+        pend_push(&q->q, val_text(s));
+    return q;
+}
+
+struct sql_Select *sql_select_bind_null(struct sql_Select *q)
+{
+    if (q)
+        pend_push(&q->q, val_null());
+    return q;
 }
 
 struct sql_Select *sql_select_group_by(struct sql_Select *q, char *expr)
@@ -795,6 +934,8 @@ struct sql_Select *sql_select_group_by(struct sql_Select *q, char *expr)
     if (!x)
         return NULL;
     if (is_hard(x->status))
+        return q;
+    if (pend_freeze(x) != 0)
         return q;
     if (!expr || !expr[0]) {
         q_fail(x, SQL_E_ARG);
@@ -816,6 +957,8 @@ struct sql_Select *sql_select_order_by(struct sql_Select *q, char *expr)
         return NULL;
     if (is_hard(x->status))
         return q;
+    if (pend_freeze(x) != 0)
+        return q;
     if (!expr || !expr[0]) {
         q_fail(x, SQL_E_ARG);
         return q;
@@ -834,6 +977,8 @@ struct sql_Select *sql_select_limit(struct sql_Select *q, int n)
         return NULL;
     if (is_hard(q->q.status))
         return q;
+    if (pend_freeze(&q->q) != 0)
+        return q;
     if (n < 0) {
         q_fail(&q->q, SQL_E_ARG);
         return q;
@@ -849,6 +994,8 @@ struct sql_Select *sql_select_offset(struct sql_Select *q, int n)
     if (!q)
         return NULL;
     if (is_hard(q->q.status))
+        return q;
+    if (pend_freeze(&q->q) != 0)
         return q;
     if (n < 0) {
         q_fail(&q->q, SQL_E_ARG);
@@ -897,7 +1044,7 @@ char *sql_select_param_text(struct sql_Select *q, int i)
 
 int sql_select_status(struct sql_Select *q)
 {
-    return q ? q->q.status : SQL_E_ARG;
+    return q_status(q ? &q->q : NULL);
 }
 
 char *sql_select_message(struct sql_Select *q)
@@ -929,32 +1076,45 @@ struct sql_Insert *sql_insert_new(char *table, char *columns)
     return s;
 }
 
-struct sql_Insert *sql_insert_values_impl(struct sql_Insert *q, int n,
-                                          const sql_value *vals)
+struct sql_Insert *sql_insert_row(struct sql_Insert *q)
 {
-    int i;
+    struct sql_Query *x = q ? &q->q : NULL;
 
-    if (!q) {
-        free_values((sql_value *)vals, n);
+    if (!x)
         return NULL;
-    }
-    if (is_hard(q->q.status)) {
-        free_values((sql_value *)vals, n);
+    if (is_hard(x->status))
         return q;
-    }
-    if (n <= 0 || n != q->q.cols) {
-        q_fail(&q->q, SQL_E_ARG);
-        free_values((sql_value *)vals, n);
+    if (pend_freeze(x) != 0)
         return q;
-    }
-    if (reserve_values(&q->q, n) != 0) {
-        q_fail(&q->q, SQL_E_OOM);
-        free_values((sql_value *)vals, n);
-        return q;
-    }
-    for (i = 0; i < n; i++)
-        q->q.values[q->q.nvalues++] = vals[i];
-    invalidate(&q->q);
+    pend_begin(x, PEND_VALUES, x->cols);
+    return q;
+}
+
+struct sql_Insert *sql_insert_bind_int(struct sql_Insert *q, long v)
+{
+    if (q)
+        pend_push(&q->q, val_int(v));
+    return q;
+}
+
+struct sql_Insert *sql_insert_bind_double(struct sql_Insert *q, double v)
+{
+    if (q)
+        pend_push(&q->q, val_double(v));
+    return q;
+}
+
+struct sql_Insert *sql_insert_bind_text(struct sql_Insert *q, char *s)
+{
+    if (q)
+        pend_push(&q->q, val_text(s));
+    return q;
+}
+
+struct sql_Insert *sql_insert_bind_null(struct sql_Insert *q)
+{
+    if (q)
+        pend_push(&q->q, val_null());
     return q;
 }
 
@@ -995,7 +1155,7 @@ char *sql_insert_param_text(struct sql_Insert *q, int i)
 
 int sql_insert_status(struct sql_Insert *q)
 {
-    return q ? q->q.status : SQL_E_ARG;
+    return q_status(q ? &q->q : NULL);
 }
 
 char *sql_insert_message(struct sql_Insert *q)
@@ -1025,10 +1185,9 @@ struct sql_Update *sql_update_new(char *table)
     return s;
 }
 
-struct sql_Update *sql_update_where_impl(struct sql_Update *q, char *cond,
-                                         int n, const sql_value *vals)
+struct sql_Update *sql_update_where(struct sql_Update *q, char *cond)
 {
-    return (struct sql_Update *)where_impl(q ? &q->q : NULL, cond, n, vals);
+    return (struct sql_Update *)where_begin(q ? &q->q : NULL, cond);
 }
 
 struct sql_Update *sql_update_where_raw(struct sql_Update *q, char *cond)
@@ -1036,10 +1195,37 @@ struct sql_Update *sql_update_where_raw(struct sql_Update *q, char *cond)
     return (struct sql_Update *)where_raw(q ? &q->q : NULL, cond);
 }
 
-struct sql_Update *sql_update_set_impl(struct sql_Update *q, char *expr,
-                                       int n, const sql_value *vals)
+struct sql_Update *sql_update_bind_int(struct sql_Update *q, long v)
 {
-    return (struct sql_Update *)set_impl(q ? &q->q : NULL, expr, n, vals);
+    if (q)
+        pend_push(&q->q, val_int(v));
+    return q;
+}
+
+struct sql_Update *sql_update_bind_double(struct sql_Update *q, double v)
+{
+    if (q)
+        pend_push(&q->q, val_double(v));
+    return q;
+}
+
+struct sql_Update *sql_update_bind_text(struct sql_Update *q, char *s)
+{
+    if (q)
+        pend_push(&q->q, val_text(s));
+    return q;
+}
+
+struct sql_Update *sql_update_bind_null(struct sql_Update *q)
+{
+    if (q)
+        pend_push(&q->q, val_null());
+    return q;
+}
+
+struct sql_Update *sql_update_set(struct sql_Update *q, char *expr)
+{
+    return (struct sql_Update *)set_begin(q ? &q->q : NULL, expr);
 }
 
 struct sql_Update *sql_update_set_raw(struct sql_Update *q, char *expr)
@@ -1089,7 +1275,7 @@ char *sql_update_param_text(struct sql_Update *q, int i)
 
 int sql_update_status(struct sql_Update *q)
 {
-    return q ? q->q.status : SQL_E_ARG;
+    return q_status(q ? &q->q : NULL);
 }
 
 char *sql_update_message(struct sql_Update *q)
@@ -1119,15 +1305,42 @@ struct sql_Delete *sql_delete_new(char *table)
     return s;
 }
 
-struct sql_Delete *sql_delete_where_impl(struct sql_Delete *q, char *cond,
-                                         int n, const sql_value *vals)
+struct sql_Delete *sql_delete_where(struct sql_Delete *q, char *cond)
 {
-    return (struct sql_Delete *)where_impl(q ? &q->q : NULL, cond, n, vals);
+    return (struct sql_Delete *)where_begin(q ? &q->q : NULL, cond);
 }
 
 struct sql_Delete *sql_delete_where_raw(struct sql_Delete *q, char *cond)
 {
     return (struct sql_Delete *)where_raw(q ? &q->q : NULL, cond);
+}
+
+struct sql_Delete *sql_delete_bind_int(struct sql_Delete *q, long v)
+{
+    if (q)
+        pend_push(&q->q, val_int(v));
+    return q;
+}
+
+struct sql_Delete *sql_delete_bind_double(struct sql_Delete *q, double v)
+{
+    if (q)
+        pend_push(&q->q, val_double(v));
+    return q;
+}
+
+struct sql_Delete *sql_delete_bind_text(struct sql_Delete *q, char *s)
+{
+    if (q)
+        pend_push(&q->q, val_text(s));
+    return q;
+}
+
+struct sql_Delete *sql_delete_bind_null(struct sql_Delete *q)
+{
+    if (q)
+        pend_push(&q->q, val_null());
+    return q;
 }
 
 struct sql_Delete *sql_delete_allow_all(struct sql_Delete *q)
@@ -1172,7 +1385,7 @@ char *sql_delete_param_text(struct sql_Delete *q, int i)
 
 int sql_delete_status(struct sql_Delete *q)
 {
-    return q ? q->q.status : SQL_E_ARG;
+    return q_status(q ? &q->q : NULL);
 }
 
 char *sql_delete_message(struct sql_Delete *q)

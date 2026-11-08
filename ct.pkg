@@ -1,14 +1,12 @@
-# sql - a dialect-neutral SQL builder (phase 1: SELECT).
+# sql - a dialect-neutral SQL builder (SELECT / INSERT / UPDATE / DELETE).
 #
 # One mapping unit (`sql/Sql.m.ct`) plus a shim pair
 # (`sql/Sql.shim.h` / `sql/Sql.shim.c`). Values are bound, never
-# concatenated: `where("id = ?", 1)` stores `1` in an ordered `sql_value`
-# array and renders the text with the `?` untouched.
+# concatenated: `where("id = ?").bindInt(1)` stores `1` in an ordered
+# `sql_value` array and renders the text with the `?` untouched.
 #
-# `cflags` keeps `_Generic` in its standard home (C11). `ct install` folds it
-# into the command it prints; a direct `ct build` needs `--cflags '-std=c11'`.
+# No `cflags`: the C face is fixed-arity and uses only C99 features.
 name = sql
-version = 0.1.0
+version = 0.2.0
 licence = MIT
-requires = ct >= 0.20.0
-cflags = -std=c11
+requires = ct >= 0.20.3
