@@ -421,7 +421,39 @@ int len = q->sql().len();   /* 复用 std 的 char * len，不要自己再定义
 `ct build` 不读 `ct.pkg` 里的 `cflags`。直接构建时漏传 `--cflags '-std=c11'` 在
 clang/GCC 上仍能编译（`_Generic` 在 c99 下只是扩展），但 `-pedantic` 会告警。
 
-## 8. 限制与未支持
+## 8. 术语表（Glossary）
+
+术语按三类收录：本包特有概念、全仓易混概念、正文出现过但未解释的英文术语。
+类型名、方法名、文件名与源码逐字一致。
+
+| 术语 | 含义 | 本包中的所指 |
+| --- | --- | --- |
+| `Entry` | 挂在表名字符串上的入口 trait，负责按语句类型创建 builder。 | `sql/Sql.m.ct` 中 `map trait Entry for type char *`，四个方法 `select` / `insert` / `update` / `delete`，接收者就是表名。 |
+| builder | 逐步拼接 SQL 文本与绑定参数的可变对象。 | `Select` / `Insert` / `Update` / `Delete` 四个句柄的统称；每个句柄对应一个 `struct sql_*` 与一组链式方法。 |
+| `Select` | SELECT builder 的方法集合。 | 宿主 `struct sql_Select *`：`where` / `whereRaw` / `groupBy` / `orderBy` / `limit` / `offset`，外加公共的渲染、参数读取与 `free`。 |
+| `Insert` | INSERT builder 的方法集合。 | 宿主 `struct sql_Insert *`：只有 `values(...)` 和一个共享尾组；列在入口 `Entry.insert(columns)` 时给定，没有 `where`。 |
+| `Update` | UPDATE builder 的方法集合。 | 宿主 `struct sql_Update *`：`set` / `setRaw` / `where` / `whereRaw` / `allowAll`。 |
+| `Delete` | DELETE builder 的方法集合。 | 宿主 `struct sql_Delete *`：`where` / `whereRaw` / `allowAll`。 |
+| `where` | 追加一个带绑定值的条件。 | `where(cond, ...)`：条件整体加括号、多个条件用 ` AND ` 连接；`?` 个数必须等于值个数，否则 `SQL_E_PARAM`。 |
+| `whereRaw` | 追加一个不带绑定值的条件。 | `whereRaw(cond)`：存在理由是 `where` 传不了 0 个值（`SQL_NARG` 在 0 实参上不可用），而 `IS NULL`、`1 = 1` 这类片段本来就没有值。 |
+| `setRaw` | 追加一个不带绑定值的赋值片段。 | UPDATE 的 `setRaw(expr)`，如 `updated_at = CURRENT_TIMESTAMP`；有值用 `set`。 |
+| `allowAll()` | 显式声明「这条 UPDATE / DELETE 确实没有 `WHERE`」。 | `Update` / `Delete` 上的方法；不调用且没有条件时渲染失败并置 `SQL_E_STATE`，防止漏条件变成全表写。 |
+| `values(...)` | 追加一行待插入的值。 | `Insert` 上的方法，1..8 个值；值数必须等于 `insert(columns)` 的列数，多行就是多次调用。 |
+| 占位符（`?`） | SQL 文本中代表一个绑定值的标记，由驱动按顺序替换。 | 值方法生成的文本里只有 `?`，真实值在 `sql_value` 数组里；`where` / `set` 调用时就核对 `?` 数与值数，不一致立刻置 `SQL_E_PARAM`。 |
+| `sql_value` | 带类型标签的绑定值，记录 kind 及其数据。 | `sql/Sql.shim.h` 的 `typedef struct sql_value`，`kind` 为 `0` null（第一期不产生）、`1` int、`2` double、`3` text；`paramKind` 返回同一套编号。 |
+| `_Generic` | C11 的调用点类型分派机制，按实参的静态类型选函数。 | `SQL_VAL(x)` 用 `_Generic(((x) + 0), ...)` 把每个变参包装成 `sql_value`；这是变参能保留类型的原因。 |
+| `SQL_NARG` / `SQL_ARGS_n` | 数变参个数的宏，以及按个数展开的 1..8 元宏。 | `sql/Sql.shim.h` 里的 `SQL_NARG` 与 `SQL_ARGS_1`..`SQL_ARGS_8`；一次带值调用最多 8 个值。 |
+| 标识符与值（identifier / value） | 标识符指表名、列名、`GROUP BY` / `ORDER BY` 表达式等 SQL 结构部分；值指要绑到 `?` 的数据。 | 标识符不转义也不校验，原样拼进 SQL，必须是可信片段；值从不进文本，只以 `sql_value` 形式排队。 |
+| `toSql` / `sql()` | 两个渲染入口：前者复制进调用方缓冲区，后者返回内部缓冲。 | `toSql(out, cap)` 返回字节数或 `-1`；`sql()` 返回内部缓冲的借用指针，下一次修改或 `free()` 后失效。 |
+| `SQL_E_*` | 本包自己的状态码前缀，由 `status()` 读取。 | `SQL_E_OK`(0) / `SQL_E_OOM`(-1) / `SQL_E_STATE`(-2) / `SQL_E_ARG`(-3) / `SQL_E_SPACE`(-4) / `SQL_E_PARAM`(-5)，定义在 `sql/Sql.shim.h`。 |
+| 句柄（handle） | 一个不透明指针，调用方只通过方法操作它，不直接碰内部结构。 | 四个 builder 句柄 `struct sql_Select *` / `struct sql_Insert *` / `struct sql_Update *` / `struct sql_Delete *`，内部结构不出包。 |
+| 宿主（host） | trait 方法挂靠的类型。 | 五个宿主：`char *`（`Entry`）与四个 `struct sql_* *`（`Select` / `Insert` / `Update` / `Delete`）。 |
+| 映射（map trait） | 把 trait 方法绑定到宿主并转调 C 函数的声明。 | `sql/Sql.m.ct` 的五段 `map trait … for …`，每行转调一个 `sql_*` 函数。 |
+| 链式返回自身（return receiver） | 方法返回接收者本身，使下一次调用可以接在后面。 | 全部结构方法（`where` / `whereRaw` / `set` / `setRaw` / `values` / `groupBy` / `orderBy` / `limit` / `offset` / `allowAll`）都返回同一个句柄；`toSql` / `sql` / `param*` / `status` / `message` / `free` 是终结或查询方法。 |
+| 所有权（ownership） | 谁负责释放一块内存的约定。 | builder 句柄归调用方，由 `free()` 释放；文本值在 `where` / `set` / `values` 时被复制进 builder，`free()` 一并释放。 |
+| 借用（borrow） | 只取得指针的使用权，不承担释放责任。 | `sql()` 与 `paramText()` 返回借用指针，有效期到下一次修改 builder 或 `free()`。 |
+
+## 9. 限制与未支持
 
 - **一次带值调用最多 8 个值**；`where` / `set` 可以拆成多次调用，INSERT 每行最多 8 列。
 - **0 个绑定值用 `whereRaw` / `setRaw`**；`where(cond)` 的零值写法要等 `__VA_OPT__` 方案定稿。
@@ -434,7 +466,7 @@ clang/GCC 上仍能编译（`_Generic` 在 c99 下只是扩展），但 `-pedant
 - **未在 Windows/MSVC 验证**；`requires` 只告警，不阻止安装。
 - 线程安全：builder 无全局状态，每个句柄独立；未做并发测试。
 
-## 9. 版本与变更记录
+## 10. 版本与变更记录
 
 - `0.1.0`（2026-11-07，未打 tag、未写入 `index/`）：完整 CRUD。
   - SELECT：`where` / `whereRaw` / `groupBy` / `orderBy` / `limit` / `offset`；
