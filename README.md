@@ -442,7 +442,7 @@ clang/GCC 上仍能编译（`_Generic` 在 c99 下只是扩展），但 `-pedant
 | 占位符（`?`） | SQL 文本中代表一个绑定值的标记，由驱动按顺序替换。 | 值方法生成的文本里只有 `?`，真实值在 `sql_value` 数组里；`where` / `set` 调用时就核对 `?` 数与值数，不一致立刻置 `SQL_E_PARAM`。 |
 | `sql_value` | 带类型标签的绑定值，记录 kind 及其数据。 | `sql/Sql.shim.h` 的 `typedef struct sql_value`，`kind` 为 `0` null（第一期不产生）、`1` int、`2` double、`3` text；`paramKind` 返回同一套编号。 |
 | `_Generic` | C11 的调用点类型分派机制，按实参的静态类型选函数。 | `SQL_VAL(x)` 用 `_Generic(((x) + 0), ...)` 把每个变参包装成 `sql_value`；这是变参能保留类型的原因。 |
-| `SQL_NARG` / `SQL_ARGS_n` | 数变参个数的宏，以及按个数展开的 1..8 元宏。 | `sql/Sql.shim.h` 里的 `SQL_NARG` 与 `SQL_ARGS_1`..`SQL_ARGS_8`；一次带值调用最多 8 个值。 |
+| `SQL_NARG` / `SQL_ARGS_1`..`SQL_ARGS_8` | 数变参个数的宏，以及按个数展开的 1..8 元宏。 | `sql/Sql.shim.h` 里的 `SQL_NARG` 与 `SQL_ARGS_1`..`SQL_ARGS_8`；一次带值调用最多 8 个值。 |
 | 标识符与值（identifier / value） | 标识符指表名、列名、`GROUP BY` / `ORDER BY` 表达式等 SQL 结构部分；值指要绑到 `?` 的数据。 | 标识符不转义也不校验，原样拼进 SQL，必须是可信片段；值从不进文本，只以 `sql_value` 形式排队。 |
 | `toSql` / `sql()` | 两个渲染入口：前者复制进调用方缓冲区，后者返回内部缓冲。 | `toSql(out, cap)` 返回字节数或 `-1`；`sql()` 返回内部缓冲的借用指针，下一次修改或 `free()` 后失效。 |
 | `SQL_E_*` | 本包自己的状态码前缀，由 `status()` 读取。 | `SQL_E_OK`(0) / `SQL_E_OOM`(-1) / `SQL_E_STATE`(-2) / `SQL_E_ARG`(-3) / `SQL_E_SPACE`(-4) / `SQL_E_PARAM`(-5)，定义在 `sql/Sql.shim.h`。 |
